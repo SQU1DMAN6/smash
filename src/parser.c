@@ -349,7 +349,7 @@ int smash_parse_line(
         Token *token = &tokens.items[i];
 
         if (token->type == TOKEN_WORD) {
-            add_argument(&current, smash_strdup(token->text));
+            add_argument(&current, smash_expand_path(token->text));
             continue;
         }
 
@@ -380,7 +380,7 @@ int smash_parse_line(
                 return 0;
             }
 
-            target = smash_strdup(tokens.items[++i].text);
+            target = smash_expand_path(tokens.items[++i].text);
 
             switch (token->type) {
                 case TOKEN_REDIR_INPUT:

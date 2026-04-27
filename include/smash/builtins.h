@@ -12,5 +12,6 @@ typedef enum {
 SmashBuiltinScope smash_builtin_scope(const char *name);
 int smash_run_builtin(SmashState *state, char **argv, int in_child);
 int smash_is_builtin(const char *name);
+int smash_command_exists(const char *name);
 
 #endif

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <ctype.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,121 @@
 #include "smash/util.h"
 
 #define PROMPT "=> "
+
+static char *evaluate_ps1(const char *ps1_template) {
+    if (!ps1_template) {
+        return smash_strdup(PROMPT);
+    }
+
+    char *result = smash_strdup("");
+    size_t result_len = 0;
+    size_t result_cap = 1;
+
+    for (const char *p = ps1_template; *p; p++) {
+        if (*p == '$' && *(p + 1) == '(') {
+            size_t cmd_len = 0;
+            const char *cmd_start = p + 2;
+            const char *cmd_end = cmd_start;
+            int depth = 1;
+
+            while (*cmd_end && depth > 0) {
+                if (*cmd_end == '(') depth++;
+                if (*cmd_end == ')') depth--;
+                if (depth > 0) cmd_end++;
+            }
+
+            if (depth == 0) {
+                cmd_len = (size_t)(cmd_end - cmd_start);
+                char *cmd = smash_xmalloc(cmd_len + 1);
+                memcpy(cmd, cmd_start, cmd_len);
+                cmd[cmd_len] = '\0';
+
+                FILE *pipe = popen(cmd, "r");
+                if (pipe) {
+                    char buf[256];
+                    while (fgets(buf, sizeof(buf), pipe)) {
+                        for (char *q = buf; *q; q++) {
+                            if (*q == '\n' || *q == '\r') {
+                                *q = '\0';
+                                break;
+                            }
+                        }
+                        size_t buf_len = strlen(buf);
+                        if (result_len + buf_len + 1 > result_cap) {
+                            result_cap = (result_len + buf_len + 1) * 2;
+                            result = smash_xrealloc(result, result_cap);
+                        }
+                        strcpy(result + result_len, buf);
+                        result_len += buf_len;
+                    }
+                    pclose(pipe);
+                }
+                free(cmd);
+                p = cmd_end;
+                continue;
+            }
+        } else if (*p == '$' && (isalpha((unsigned char)*(p + 1)) || *(p + 1) == '_')) {
+            size_t var_len = 0;
+            const char *var_start = p + 1;
+            const char *var_end = var_start;
+            while (*var_end && (isalnum((unsigned char)*var_end) || *var_end == '_')) {
+                var_end++;
+            }
+            var_len = (size_t)(var_end - var_start);
+            char *var_name = smash_xmalloc(var_len + 1);
+            memcpy(var_name, var_start, var_len);
+            var_name[var_len] = '\0';
+
+            const char *var_value = getenv(var_name);
+            if (var_value) {
+                size_t val_len = strlen(var_value);
+                if (result_len + val_len + 1 > result_cap) {
+                    result_cap = (result_len + val_len + 1) * 2;
+                    result = smash_xrealloc(result, result_cap);
+                }
+                strcpy(result + result_len, var_value);
+                result_len += val_len;
+            }
+            free(var_name);
+            p = var_end - 1;
+            continue;
+        } else if (*p == '\\' && *(p + 1)) {
+            p++;
+            if (*p == 'n') {
+                if (result_len + 2 > result_cap) {
+                    result_cap = (result_len + 2) * 2;
+                    result = smash_xrealloc(result, result_cap);
+                }
+                result[result_len++] = '\n';
+                result[result_len] = '\0';
+            } else if (*p == 'r') {
+                if (result_len + 2 > result_cap) {
+                    result_cap = (result_len + 2) * 2;
+                    result = smash_xrealloc(result, result_cap);
+                }
+                result[result_len++] = '\r';
+                result[result_len] = '\0';
+            } else {
+                if (result_len + 2 > result_cap) {
+                    result_cap = (result_len + 2) * 2;
+                    result = smash_xrealloc(result, result_cap);
+                }
+                result[result_len++] = *p;
+                result[result_len] = '\0';
+            }
+            continue;
+        }
+
+        if (result_len + 2 > result_cap) {
+            result_cap = (result_len + 2) * 2;
+            result = smash_xrealloc(result, result_cap);
+        }
+        result[result_len++] = *p;
+        result[result_len] = '\0';
+    }
+
+    return result;
+}
 
 static void ignore_shell_signals(void) {
     signal(SIGINT, SIG_IGN);
@@ -43,7 +159,7 @@ int smash_execute_line(SmashState *state, const char *line, int interactive) {
     char *error_message = NULL;
     int status = 0;
 
-    if (*trimmed == '\0') {
+    if (*trimmed == '\0' || *trimmed == '#') {
         free(working);
         return 0;
     }
@@ -109,6 +225,9 @@ int smash_init(SmashState *state) {
 
     ignore_shell_signals();
     sync_shell_environment();
+    
+    setenv("PS1", "$(pwd) => ", 0);
+    
     smash_history_load(state);
 
     if (state->config_path && access(state->config_path, F_OK) == 0) {
@@ -125,6 +244,14 @@ void smash_cleanup(SmashState *state) {
     free(state->config_path);
     state->history_path = NULL;
     state->config_path = NULL;
+    
+    for (size_t i = 0; i < state->alias_count; i++) {
+        free(state->aliases[i].name);
+        free(state->aliases[i].value);
+    }
+    free(state->aliases);
+    state->aliases = NULL;
+    state->alias_count = 0;
 }
 
 int smash_run(SmashState *state) {
@@ -132,7 +259,10 @@ int smash_run(SmashState *state) {
     smash_term_enable_raw(state);
 
     while (!state->exit_requested) {
-        char *line = smash_read_line(state, PROMPT, 1);
+        const char *ps1_template = getenv("PS1");
+        char *prompt = evaluate_ps1(ps1_template);
+        char *line = smash_read_line(state, prompt, 1);
+        free(prompt);
 
         if (!line) {
             state->exit_requested = 1;

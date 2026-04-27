@@ -14,7 +14,14 @@
 
 static int print_help(void) {
     static const char *message =
-        "Builtins: cd, clear, exit, help, history, pwd, source, which\n";
+        "Builtins:\n"
+        "  Navigation: cd, pwd\n"
+        "  Variables: set, export, unset, declare\n"
+        "  Commands: type, which, alias\n"
+        "  History: history\n"
+        "  I/O: clear\n"
+        "  Scripting: source (.)\n"
+        "  Shell: exit, help\n";
 
     write(STDOUT_FILENO, message, strlen(message));
     return 0;
@@ -99,6 +106,59 @@ static int run_history(SmashState *state, char **argv, int in_child) {
     }
 
     smash_history_print(state);
+    return 0;
+}
+
+static int run_set(SmashState *state, char **argv, int in_child) {
+    (void) state;
+
+    if (in_child) {
+        fprintf(stderr, "smash: set: cannot be used in a pipeline\n");
+        return 1;
+    }
+
+    if (!argv[1]) {
+        extern char **environ;
+        for (char **env = environ; *env; env++) {
+            printf("%s\n", *env);
+        }
+        return 0;
+    }
+
+    char *name = NULL;
+    const char *value = NULL;
+    char *equals = strchr(argv[1], '=');
+
+    if (equals) {
+        size_t name_len = (size_t)(equals - argv[1]);
+        if (name_len == 0) {
+            fprintf(stderr, "smash: set: invalid variable name\n");
+            return 1;
+        }
+
+        name = smash_xmalloc(name_len + 1);
+        memcpy(name, argv[1], name_len);
+        name[name_len] = '\0';
+        value = equals + 1;
+    } else if (argv[2]) {
+        name = argv[1];
+        value = argv[2];
+    } else {
+        fprintf(stderr, "smash: set: expected name=value or name value\n");
+        return 1;
+    }
+
+    if (setenv(name, value, 1) != 0) {
+        fprintf(stderr, "smash: set: failed to set %s: %s\n", name, strerror(errno));
+        if (equals) {
+            free(name);
+        }
+        return 1;
+    }
+
+    if (equals) {
+        free(name);
+    }
     return 0;
 }
 
@@ -224,6 +284,200 @@ static int run_which(char **argv) {
     return status;
 }
 
+static int run_export(SmashState *state, char **argv, int in_child) {
+    (void) state;
+
+    if (in_child) {
+        fprintf(stderr, "smash: export: cannot be used in a pipeline\n");
+        return 1;
+    }
+
+    if (!argv[1]) {
+        extern char **environ;
+        for (char **env = environ; *env; env++) {
+            printf("export %s\n", *env);
+        }
+        return 0;
+    }
+
+    for (int i = 1; argv[i]; i++) {
+        char *equals = strchr(argv[i], '=');
+        if (equals) {
+            size_t name_len = (size_t)(equals - argv[i]);
+            char *name = smash_xmalloc(name_len + 1);
+            memcpy(name, argv[i], name_len);
+            name[name_len] = '\0';
+            setenv(name, equals + 1, 1);
+            free(name);
+        } else {
+            const char *value = getenv(argv[i]);
+            if (value) {
+                setenv(argv[i], value, 1);
+            }
+        }
+    }
+    return 0;
+}
+
+static int run_unset(SmashState *state, char **argv, int in_child) {
+    (void) state;
+
+    if (in_child) {
+        fprintf(stderr, "smash: unset: cannot be used in a pipeline\n");
+        return 1;
+    }
+
+    if (!argv[1]) {
+        fprintf(stderr, "smash: unset: expected at least one variable\n");
+        return 1;
+    }
+
+    for (int i = 1; argv[i]; i++) {
+        unsetenv(argv[i]);
+    }
+    return 0;
+}
+
+static int run_alias(SmashState *state, char **argv, int in_child) {
+    if (in_child) {
+        fprintf(stderr, "smash: alias: cannot be used in a pipeline\n");
+        return 1;
+    }
+
+    if (!argv[1]) {
+        for (size_t i = 0; i < state->alias_count; i++) {
+            printf("alias %s='%s'\n", state->aliases[i].name, state->aliases[i].value);
+        }
+        return 0;
+    }
+
+    for (int i = 1; argv[i]; i++) {
+        char *equals = strchr(argv[i], '=');
+        if (!equals) {
+            for (size_t j = 0; j < state->alias_count; j++) {
+                if (strcmp(state->aliases[j].name, argv[i]) == 0) {
+                    printf("alias %s='%s'\n", state->aliases[j].name, state->aliases[j].value);
+                    return 0;
+                }
+            }
+            fprintf(stderr, "smash: alias: %s not found\n", argv[i]);
+            return 1;
+        }
+
+        size_t name_len = (size_t)(equals - argv[i]);
+        char *name = smash_xmalloc(name_len + 1);
+        memcpy(name, argv[i], name_len);
+        name[name_len] = '\0';
+
+        for (size_t j = 0; j < state->alias_count; j++) {
+            if (strcmp(state->aliases[j].name, name) == 0) {
+                free(state->aliases[j].value);
+                state->aliases[j].value = smash_strdup(equals + 1);
+                free(name);
+                return 0;
+            }
+        }
+
+        if (state->alias_count >= SMASH_ALIAS_LIMIT) {
+            fprintf(stderr, "smash: alias limit exceeded\n");
+            free(name);
+            return 1;
+        }
+
+        state->aliases = smash_xrealloc(state->aliases, (state->alias_count + 1) * sizeof(SmashAlias));
+        state->aliases[state->alias_count].name = name;
+        state->aliases[state->alias_count].value = smash_strdup(equals + 1);
+        state->alias_count++;
+    }
+    return 0;
+}
+
+static int run_type(SmashState *state, char **argv, int in_child) {
+    (void) state;
+    (void) in_child;
+
+    if (!argv[1]) {
+        fprintf(stderr, "smash: type: expected at least one command\n");
+        return 1;
+    }
+
+    for (int i = 1; argv[i]; i++) {
+        if (smash_is_builtin(argv[i])) {
+            printf("%s is a shell builtin\n", argv[i]);
+        } else if (smash_command_exists(argv[i])) {
+            printf("%s is a command\n", argv[i]);
+        } else {
+            printf("%s not found\n", argv[i]);
+        }
+    }
+    return 0;
+}
+
+static int run_declare(SmashState *state, char **argv, int in_child) {
+    (void) state;
+
+    if (in_child) {
+        fprintf(stderr, "smash: declare: cannot be used in a pipeline\n");
+        return 1;
+    }
+
+    for (int i = 1; argv[i]; i++) {
+        char *equals = strchr(argv[i], '=');
+        if (equals) {
+            size_t name_len = (size_t)(equals - argv[i]);
+            char *name = smash_xmalloc(name_len + 1);
+            memcpy(name, argv[i], name_len);
+            name[name_len] = '\0';
+            setenv(name, equals + 1, 1);
+            free(name);
+        } else {
+            setenv(argv[i], "", 1);
+        }
+    }
+    return 0;
+}
+
+int smash_command_exists(const char *name) {
+    if (!name || !*name) {
+        return 0;
+    }
+
+    if (smash_is_builtin(name)) {
+        return 1;
+    }
+
+    if (strchr(name, '/')) {
+        return access(name, X_OK) == 0;
+    }
+
+    const char *path = getenv("PATH");
+    if (!path) {
+        return 0;
+    }
+
+    char *copy = smash_strdup(path);
+    char *segment = strtok(copy, ":");
+    int found = 0;
+
+    while (segment) {
+        size_t len = strlen(segment) + strlen(name) + 2;
+        char *candidate = smash_xmalloc(len);
+
+        snprintf(candidate, len, "%s/%s", segment, name);
+        if (access(candidate, X_OK) == 0) {
+            found = 1;
+            free(candidate);
+            break;
+        }
+
+        free(candidate);
+        segment = strtok(NULL, ":");
+    }
+
+    free(copy);
+    return found;
+}
+
 int smash_is_builtin(const char *name) {
     return smash_builtin_scope(name) != SMASH_BUILTIN_NONE;
 }
@@ -237,6 +491,11 @@ SmashBuiltinScope smash_builtin_scope(const char *name) {
         strcmp(name, "exit") == 0 ||
         strcmp(name, "history") == 0 ||
         strcmp(name, "source") == 0 ||
+        strcmp(name, "set") == 0 ||
+        strcmp(name, "export") == 0 ||
+        strcmp(name, "unset") == 0 ||
+        strcmp(name, "alias") == 0 ||
+        strcmp(name, "declare") == 0 ||
         strcmp(name, ".") == 0) {
         return SMASH_BUILTIN_PARENT;
     }
@@ -244,7 +503,8 @@ SmashBuiltinScope smash_builtin_scope(const char *name) {
     if (strcmp(name, "pwd") == 0 ||
         strcmp(name, "clear") == 0 ||
         strcmp(name, "help") == 0 ||
-        strcmp(name, "which") == 0) {
+        strcmp(name, "which") == 0 ||
+        strcmp(name, "type") == 0) {
         return SMASH_BUILTIN_CHILD;
     }
 
@@ -271,7 +531,9 @@ int smash_run_builtin(SmashState *state, char **argv, int in_child) {
     if (strcmp(argv[0], "help") == 0) {
         return print_help();
     }
-
+    if (strcmp(argv[0], "set") == 0) {
+        return run_set(state, argv, in_child);
+    }
     if (strcmp(argv[0], "history") == 0) {
         return run_history(state, argv, in_child);
     }
@@ -286,6 +548,26 @@ int smash_run_builtin(SmashState *state, char **argv, int in_child) {
 
     if (strcmp(argv[0], "which") == 0) {
         return run_which(argv);
+    }
+
+    if (strcmp(argv[0], "export") == 0) {
+        return run_export(state, argv, in_child);
+    }
+
+    if (strcmp(argv[0], "unset") == 0) {
+        return run_unset(state, argv, in_child);
+    }
+
+    if (strcmp(argv[0], "alias") == 0) {
+        return run_alias(state, argv, in_child);
+    }
+
+    if (strcmp(argv[0], "type") == 0) {
+        return run_type(state, argv, in_child);
+    }
+
+    if (strcmp(argv[0], "declare") == 0) {
+        return run_declare(state, argv, in_child);
     }
 
     return 1;

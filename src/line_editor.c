@@ -10,8 +10,144 @@
 #include "smash/line_editor.h"
 #include "smash/term.h"
 #include "smash/util.h"
+#include "smash/builtins.h"
 
 #define SMASH_LINE_BUFFER 1024
+
+static const char *ANSI_RESET = "\x1b[0m";
+static const char *ANSI_GREEN = "\x1b[32m";
+static const char *ANSI_BLUE = "\x1b[34m";
+static const char *ANSI_RED = "\x1b[31m";
+static const char *ANSI_GREY = "\x1b[90m";
+static const char *ANSI_WHITE = "\x1b[37m";
+static const char *ANSI_ORANGE = "\x1b[33m";
+
+static int history_matches_prefix(const char *entry, const char *prefix) {
+    if (!prefix) {
+        return 1;
+    }
+
+    size_t prefix_len = strlen(prefix);
+    return prefix_len == 0 || strncmp(entry, prefix, prefix_len) == 0;
+}
+
+static void flush_colored_segment(const char *buffer, int start, int end, const char *color) {
+    if (end <= start) {
+        return;
+    }
+
+    if (color == ANSI_WHITE) {
+        write(STDOUT_FILENO, buffer + start, (size_t) (end - start));
+        return;
+    }
+
+    write(STDOUT_FILENO, color, strlen(color));
+    write(STDOUT_FILENO, buffer + start, (size_t) (end - start));
+    write(STDOUT_FILENO, ANSI_RESET, strlen(ANSI_RESET));
+}
+
+static void highlight_line(const char *buffer) {
+    int i = 0;
+    int token_start = 0;
+    int token_end = 0;
+    int in_single = 0;
+    int in_double = 0;
+    int comment = 0;
+    int in_token = 0;
+    const char *color = ANSI_WHITE;
+    const char *segment_color = ANSI_WHITE;
+    int segment_start = 0;
+    char *command_name = NULL;
+    int command_valid = 0;
+
+    while (buffer[token_end] && isspace((unsigned char)buffer[token_end])) {
+        token_end++;
+    }
+
+    token_start = token_end;
+    while (buffer[token_end] && !isspace((unsigned char)buffer[token_end])) {
+        if (buffer[token_end] == '\'') {
+            token_end++;
+            while (buffer[token_end] && buffer[token_end] != '\'') {
+                token_end++;
+            }
+        } else if (buffer[token_end] == '"') {
+            token_end++;
+            while (buffer[token_end] && buffer[token_end] != '"') {
+                token_end++;
+            }
+        }
+        if (buffer[token_end]) {
+            token_end++;
+        }
+    }
+
+    if (token_start < token_end && buffer[token_start] != '#') {
+        int name_start = token_start;
+        int name_end = token_end;
+        if ((buffer[name_start] == '\'' || buffer[name_start] == '"') && name_end > name_start + 1) {
+            name_start++;
+            if (buffer[name_end - 1] == buffer[name_start - 1]) {
+                name_end--;
+            }
+        }
+        if (name_end > name_start) {
+            command_name = smash_xmalloc((size_t)(name_end - name_start + 1));
+            memcpy(command_name, buffer + name_start, (size_t)(name_end - name_start));
+            command_name[name_end - name_start] = '\0';
+            command_valid = smash_command_exists(command_name);
+            free(command_name);
+        }
+    }
+
+    while (buffer[i]) {
+        const char *next_color = ANSI_WHITE;
+        char ch = buffer[i];
+
+        if (comment) {
+            next_color = ANSI_GREY;
+        } else if (in_single || in_double) {
+            next_color = ANSI_ORANGE;
+        } else if (ch == '#') {
+            next_color = ANSI_GREY;
+            comment = 1;
+            in_token = 0;
+        } else if (isspace((unsigned char)ch)) {
+            next_color = ANSI_WHITE;
+            in_token = 0;
+        } else if (!in_token) {
+            if (i == token_start) {
+                next_color = command_valid ? ANSI_GREEN : ANSI_RED;
+            } else if (ch == '-') {
+                next_color = ANSI_BLUE;
+            } else {
+                next_color = ANSI_WHITE;
+            }
+            in_token = 1;
+        } else {
+            next_color = color;
+        }
+
+        if (!comment && ch == '\'' && !in_double) {
+            in_single = !in_single;
+            next_color = ANSI_ORANGE;
+        } else if (!comment && ch == '"' && !in_single) {
+            in_double = !in_double;
+            next_color = ANSI_ORANGE;
+        }
+
+        if (next_color != segment_color) {
+            flush_colored_segment(buffer, segment_start, i, segment_color);
+            segment_start = i;
+            segment_color = next_color;
+        }
+
+        color = next_color;
+        i++;
+    }
+
+    flush_colored_segment(buffer, segment_start, i, segment_color);
+}
 
 enum {
     KEY_ARROW_UP = 1000,
@@ -200,7 +336,7 @@ static void refresh_line(
     write(STDOUT_FILENO, "\x1b[J", 3);
     write(STDOUT_FILENO, prompt, strlen(prompt));
     if (length > 0) {
-        write(STDOUT_FILENO, buffer, (size_t) length);
+        highlight_line(buffer);
     }
 
     write(STDOUT_FILENO, "\r", 1);
@@ -213,6 +349,9 @@ char *smash_read_line(SmashState *state, const char *prompt, int save_history) {
     int length = 0;
     int cursor = 0;
     size_t history_index = state->history_count;
+    char *saved_buffer = NULL;
+    char *history_prefix = NULL;
+    int saved_length = 0;
     char *buffer = smash_xmalloc((size_t) capacity);
 
     buffer[0] = '\0';
@@ -224,6 +363,8 @@ char *smash_read_line(SmashState *state, const char *prompt, int save_history) {
 
         if (key == -1) {
             free(buffer);
+            free(saved_buffer);
+            free(history_prefix);
             return NULL;
         }
 
@@ -249,6 +390,10 @@ char *smash_read_line(SmashState *state, const char *prompt, int save_history) {
             cursor = 0;
             buffer[0] = '\0';
             history_index = state->history_count;
+            free(saved_buffer);
+            saved_buffer = NULL;
+            free(history_prefix);
+            history_prefix = NULL;
             refresh_line(prompt, buffer, length, cursor, previous_cursor);
             continue;
         }
@@ -259,34 +404,74 @@ char *smash_read_line(SmashState *state, const char *prompt, int save_history) {
             if (save_history && length > 0) {
                 smash_history_add(state, buffer, 1);
             }
+            free(saved_buffer);
+            free(history_prefix);
             return buffer;
         }
 
-        if (key == KEY_ARROW_UP && history_index > 0) {
-            history_index--;
-            length = (int) strlen(state->history[history_index]);
-            ensure_buffer_capacity(&buffer, &capacity, length + 1);
-            memcpy(buffer, state->history[history_index], (size_t) length + 1);
-            cursor = length;
-            refresh_line(prompt, buffer, length, cursor, previous_cursor);
+        if (key == KEY_ARROW_UP) {
+            if (!history_prefix) {
+                history_prefix = smash_strdup(buffer);
+                saved_buffer = smash_strdup(buffer);
+                saved_length = length;
+            }
+
+            size_t search_index = history_index == state->history_count ? state->history_count : history_index;
+            size_t found_index = state->history_count;
+            for (size_t i = search_index; i-- > 0;) {
+                if (history_matches_prefix(state->history[i], history_prefix)) {
+                    found_index = i;
+                    break;
+                }
+            }
+
+            if (found_index < state->history_count) {
+                history_index = found_index;
+                length = (int) strlen(state->history[history_index]);
+                ensure_buffer_capacity(&buffer, &capacity, length + 1);
+                memcpy(buffer, state->history[history_index], (size_t) length + 1);
+                cursor = length;
+                refresh_line(prompt, buffer, length, cursor, previous_cursor);
+            }
             continue;
         }
 
-        if (key == KEY_ARROW_DOWN && history_index < state->history_count - 1) {
-            history_index++;
-            length = (int) strlen(state->history[history_index]);
-            ensure_buffer_capacity(&buffer, &capacity, length + 1);
-            memcpy(buffer, state->history[history_index], (size_t) length + 1);
-            cursor = length;
-            refresh_line(prompt, buffer, length, cursor, previous_cursor);
-            continue;
-        }
+        if (key == KEY_ARROW_DOWN) {
+            if (!history_prefix) {
+                history_prefix = smash_strdup(buffer);
+                saved_buffer = smash_strdup(buffer);
+                saved_length = length;
+            }
 
-        if (key == KEY_ARROW_DOWN && history_index == state->history_count - 1) {
-            history_index = state->history_count;
-            length = 0;
-            cursor = 0;
-            buffer[0] = '\0';
+            size_t start_index = history_index == state->history_count ? 0 : history_index + 1;
+            size_t found_index = state->history_count;
+            for (size_t i = start_index; i < state->history_count; i++) {
+                if (history_matches_prefix(state->history[i], history_prefix)) {
+                    found_index = i;
+                    break;
+                }
+            }
+
+            if (found_index < state->history_count) {
+                history_index = found_index;
+                length = (int) strlen(state->history[history_index]);
+                ensure_buffer_capacity(&buffer, &capacity, length + 1);
+                memcpy(buffer, state->history[history_index], (size_t) length + 1);
+                cursor = length;
+            } else if (history_index != state->history_count) {
+                history_index = state->history_count;
+                if (saved_buffer) {
+                    length = saved_length;
+                    ensure_buffer_capacity(&buffer, &capacity, length + 1);
+                    memcpy(buffer, saved_buffer, (size_t) length + 1);
+                    cursor = length;
+                } else {
+                    length = 0;
+                    cursor = 0;
+                    buffer[0] = '\0';
+                }
+            }
+
             refresh_line(prompt, buffer, length, cursor, previous_cursor);
             continue;
         }
