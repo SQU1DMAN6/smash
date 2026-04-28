@@ -6,6 +6,7 @@ A lightweight, modern shell implementation written in C with real-time syntax hi
 
 - **Real-time Syntax Highlighting**: Commands in green (when valid) or red (when invalid), flags in blue, strings in orange, comments in grey
 - **Fish-like History Search**: Prefix-based history navigation using Up/Down arrow keys
+- **Tab Completion**: Press Tab to auto-complete file and directory names
 - **PS1 Customization**: Dynamic prompt with variable and command substitution
 - **Configuration File**: `~/.smashrc` for shell initialization
 - **History Persistence**: Command history saved to `~/.smash_history`
@@ -245,6 +246,19 @@ ps aux | grep process_name
 - **Ctrl+E**: Go to end of line
 - **Ctrl+C**: Cancel current input
 - **Ctrl+D**: Exit shell (if input is empty)
+
+### Tab Completion
+
+Press **Tab** to auto-complete file and directory names in the current directory:
+- Single match: Automatically completes the name
+- Multiple matches: Displays up to 10 matching entries
+- Directory matches: Automatically appended with `/`
+
+Example:
+```bash
+=> cd Do[TAB]
+=> cd Documents/
+```
 
 ### Syntax Highlighting
 

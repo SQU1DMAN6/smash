@@ -19,3 +19,15 @@ src/%.o: src/%.c
 
 clean:
 	rm -f smash main.o src/*.o
+	rm -f smash*.sqar
+	rm -f smash*.fsdl
+
+deploy: smash
+	cp smash BUILD/linux-x64/smash
+	ftr pack . -C smash
+	ftr up smash*.sqar JFtR/smash
+	rm smash*.sqar
+	ftr pack . -U smash
+	ftr up smash*.fsdl JFtR/smash
+	rm smash*.fsdl
+	ftr query JFtR/smash

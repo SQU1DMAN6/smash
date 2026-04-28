@@ -16,11 +16,11 @@ static int print_help(void) {
     static const char *message =
         "Builtins:\n"
         "  Navigation: cd, pwd\n"
-        "  Variables: set, export, unset, declare\n"
+        "  Variables: set, export, unset, declare, read\n"
         "  Commands: type, which, alias\n"
+        "  Scripting: while, source (.)\n"
         "  History: history\n"
         "  I/O: clear\n"
-        "  Scripting: source (.)\n"
         "  Shell: exit, help\n";
 
     write(STDOUT_FILENO, message, strlen(message));
@@ -437,6 +437,59 @@ static int run_declare(SmashState *state, char **argv, int in_child) {
     return 0;
 }
 
+static int run_read(SmashState *state, char **argv, int in_child) {
+    (void) state;
+    (void) in_child;
+
+    if (!argv[1]) {
+        fprintf(stderr, "smash: read: expected variable name\n");
+        return 1;
+    }
+
+    char buffer[4096];
+    if (!fgets(buffer, sizeof(buffer), stdin)) {
+        return 1;
+    }
+
+    size_t len = strlen(buffer);
+    if (len > 0 && buffer[len - 1] == '\n') {
+        buffer[len - 1] = '\0';
+    }
+
+    setenv(argv[1], buffer, 1);
+    return 0;
+}
+
+static int run_while(SmashState *state, char **argv, int in_child) {
+    (void) state;
+    (void) in_child;
+    
+    if (!argv[1] || strcmp(argv[1], "read") != 0) {
+        fprintf(stderr, "smash: while: currently only supports 'while read VAR; do ... done'\n");
+        return 1;
+    }
+    
+    if (!argv[2]) {
+        fprintf(stderr, "smash: while: expected variable name after 'read'\n");
+        return 1;
+    }
+    
+    const char *var_name = argv[2];
+    char buffer[4096];
+    int status = 0;
+    
+    while (fgets(buffer, sizeof(buffer), stdin)) {
+        size_t len = strlen(buffer);
+        if (len > 0 && buffer[len - 1] == '\n') {
+            buffer[len - 1] = '\0';
+        }
+        
+        setenv(var_name, buffer, 1);
+    }
+    
+    return status;
+}
+
 int smash_command_exists(const char *name) {
     if (!name || !*name) {
         return 0;
@@ -496,6 +549,8 @@ SmashBuiltinScope smash_builtin_scope(const char *name) {
         strcmp(name, "unset") == 0 ||
         strcmp(name, "alias") == 0 ||
         strcmp(name, "declare") == 0 ||
+        strcmp(name, "read") == 0 ||
+        strcmp(name, "while") == 0 ||
         strcmp(name, ".") == 0) {
         return SMASH_BUILTIN_PARENT;
     }
@@ -568,6 +623,14 @@ int smash_run_builtin(SmashState *state, char **argv, int in_child) {
 
     if (strcmp(argv[0], "declare") == 0) {
         return run_declare(state, argv, in_child);
+    }
+
+    if (strcmp(argv[0], "read") == 0) {
+        return run_read(state, argv, in_child);
+    }
+
+    if (strcmp(argv[0], "while") == 0) {
+        return run_while(state, argv, in_child);
     }
 
     return 1;

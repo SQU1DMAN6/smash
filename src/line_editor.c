@@ -1,9 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "smash/history.h"
@@ -159,8 +161,85 @@ enum {
     KEY_ALT_BACKSPACE,
     KEY_DELETE,
     KEY_HOME,
-    KEY_END
+    KEY_END,
+    KEY_TAB = 9
 };
+
+static int get_word_at_cursor(const char *buffer, int cursor, char *word_out) {
+    int start = cursor - 1;
+    while (start >= 0 && !isspace((unsigned char)buffer[start])) {
+        start--;
+    }
+    start++;
+
+    int len = cursor - start;
+    if (len > 255) len = 255;
+    if (len > 0) {
+        memcpy(word_out, buffer + start, len);
+    }
+    word_out[len] = '\0';
+    return start;
+}
+
+static void complete_file_path(const char *prefix, char **matches, int *match_count) {
+    DIR *dir = NULL;
+    struct dirent *entry;
+    const char *search_dir = ".";
+    char search_prefix[256] = "";
+    const char *p = prefix;
+
+    if (!prefix || *prefix == '\0') {
+        dir = opendir(".");
+    } else {
+        const char *last_slash = strrchr(prefix, '/');
+        if (last_slash) {
+            size_t dir_len = (size_t)(last_slash - prefix + 1);
+            if (dir_len < sizeof(search_prefix)) {
+                memcpy(search_prefix, prefix, dir_len);
+                search_prefix[dir_len] = '\0';
+            }
+            search_dir = search_prefix;
+            p = last_slash + 1;
+            dir = opendir(search_prefix[0] ? search_prefix : ".");
+        } else {
+            dir = opendir(".");
+        }
+    }
+
+    if (!dir) return;
+
+    size_t prefix_len = strlen(p);
+    *match_count = 0;
+
+    while ((entry = readdir(dir)) && *match_count < 10) {
+        if (strncmp(entry->d_name, p, prefix_len) == 0 && strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
+            char full_path[512];
+            if (search_dir[0] && strcmp(search_dir, ".") != 0) {
+                snprintf(full_path, sizeof(full_path), "%s%s", search_dir, entry->d_name);
+            } else {
+                snprintf(full_path, sizeof(full_path), "%s", entry->d_name);
+            }
+
+            struct stat st;
+            if (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                size_t len = strlen(full_path);
+                if (len + 1 < 256) {
+                    strcat(full_path, "/");
+                }
+            }
+
+            matches[*match_count] = smash_strdup(full_path);
+            (*match_count)++;
+        }
+    }
+    closedir(dir);
+}
+
+static void free_matches(char **matches, int count) {
+    for (int i = 0; i < count; i++) {
+        free(matches[i]);
+    }
+}
 
 static int read_key(void) {
     char c;
@@ -539,6 +618,43 @@ char *smash_read_line(SmashState *state, const char *prompt, int save_history) {
             length--;
             buffer[length] = '\0';
             refresh_line(prompt, buffer, length, cursor, previous_cursor);
+            continue;
+        }
+
+        if (key == KEY_TAB) {
+            char word[256];
+            (void) get_word_at_cursor(buffer, cursor, word);
+            char *matches[10];
+            int match_count = 0;
+
+            complete_file_path(word, matches, &match_count);
+
+            if (match_count == 1) {
+                const char *completion = matches[0];
+                size_t comp_len = strlen(completion);
+                size_t word_len = strlen(word);
+                size_t insert_len = comp_len - word_len;
+
+                ensure_buffer_capacity(&buffer, &capacity, length + (int)insert_len + 1);
+                memmove(buffer + cursor + insert_len, buffer + cursor, (size_t)(length - cursor + 1));
+                memcpy(buffer + cursor, completion + word_len, insert_len);
+                length += (int)insert_len;
+                cursor += (int)insert_len;
+
+                free_matches(matches, match_count);
+                refresh_line(prompt, buffer, length, cursor, previous_cursor);
+            } else if (match_count > 1) {
+                write(STDOUT_FILENO, "\n", 1);
+                for (int i = 0; i < match_count; i++) {
+                    write(STDOUT_FILENO, matches[i], strlen(matches[i]));
+                    write(STDOUT_FILENO, "  ", 2);
+                }
+                write(STDOUT_FILENO, "\n", 1);
+                free_matches(matches, match_count);
+                refresh_line(prompt, buffer, length, cursor, previous_cursor);
+            } else {
+                free_matches(matches, match_count);
+            }
             continue;
         }
 

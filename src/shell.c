@@ -255,7 +255,7 @@ void smash_cleanup(SmashState *state) {
 }
 
 int smash_run(SmashState *state) {
-    printf("SMASH 0.1.0, written by Quan Thai\n");
+    printf("SMASH 1.0.0, written by Quan Thai\n");
     smash_term_enable_raw(state);
 
     while (!state->exit_requested) {
